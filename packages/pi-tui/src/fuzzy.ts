@@ -9,8 +9,34 @@ export interface FuzzyMatch {
 	score: number;
 }
 
-export function fuzzyMatch(query: string, text: string): FuzzyMatch {
+/**
+ * Query spellings `fuzzyMatch` accepts, lower-cased: the query as typed plus,
+ * for a letters-then-digits (or digits-then-letters) query, the same characters
+ * with the two runs swapped, so "foo2" also reaches "2/foo.ts".
+ *
+ * Exported so callers that narrow candidates before scoring (e.g. an fd
+ * pre-filter) can accept everything `fuzzyMatch` would — otherwise the
+ * pre-filter and the scorer disagree about what matches.
+ */
+export function fuzzyQueryVariants(query: string): [string, string?] {
 	const queryLower = query.toLowerCase();
+
+	const alphaNumericMatch = queryLower.match(/^(?<letters>[a-z]+)(?<digits>[0-9]+)$/);
+	const numericAlphaMatch = queryLower.match(/^(?<digits>[0-9]+)(?<letters>[a-z]+)$/);
+	const swappedQuery = alphaNumericMatch
+		? `${alphaNumericMatch.groups?.["digits"] ?? ""}${alphaNumericMatch.groups?.["letters"] ?? ""}`
+		: numericAlphaMatch
+			? `${numericAlphaMatch.groups?.["letters"] ?? ""}${numericAlphaMatch.groups?.["digits"] ?? ""}`
+			: "";
+
+	if (!swappedQuery) {
+		return [queryLower];
+	}
+
+	return [queryLower, swappedQuery];
+}
+
+export function fuzzyMatch(query: string, text: string): FuzzyMatch {
 	const textLower = text.toLowerCase();
 
 	const matchQuery = (normalizedQuery: string): FuzzyMatch => {
@@ -67,18 +93,11 @@ export function fuzzyMatch(query: string, text: string): FuzzyMatch {
 		return { matches: true, score };
 	};
 
-	const primaryMatch = matchQuery(queryLower);
+	const [primaryQuery, swappedQuery] = fuzzyQueryVariants(query);
+	const primaryMatch = matchQuery(primaryQuery);
 	if (primaryMatch.matches) {
 		return primaryMatch;
 	}
-
-	const alphaNumericMatch = queryLower.match(/^(?<letters>[a-z]+)(?<digits>[0-9]+)$/);
-	const numericAlphaMatch = queryLower.match(/^(?<digits>[0-9]+)(?<letters>[a-z]+)$/);
-	const swappedQuery = alphaNumericMatch
-		? `${alphaNumericMatch.groups?.["digits"] ?? ""}${alphaNumericMatch.groups?.["letters"] ?? ""}`
-		: numericAlphaMatch
-			? `${numericAlphaMatch.groups?.["letters"] ?? ""}${numericAlphaMatch.groups?.["digits"] ?? ""}`
-			: "";
 
 	if (!swappedQuery) {
 		return primaryMatch;

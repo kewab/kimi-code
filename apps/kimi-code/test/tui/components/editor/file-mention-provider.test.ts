@@ -296,6 +296,57 @@ describe('FileMentionProvider', () => {
     expect(result!.items.map((item) => item.value)).toContain('@src/components/Button.tsx');
   });
 
+  it('fuzzy-matches a subsequence spanning path segments in the filesystem fallback', async () => {
+    mkdirSync(join(workDir, 'aa', 'bb'), { recursive: true });
+    writeFileSync(join(workDir, 'aa', 'bb', 'cc.go'), 'package main');
+    const provider = new FileMentionProvider([], workDir, NO_FD);
+
+    const result = await provider.getSuggestions(['@aabc'], 0, 5, { signal: ctrl() });
+
+    expect(result).not.toBeNull();
+    expect(result!.items.map((item) => item.value)).toContain('@aa/bb/cc.go');
+  });
+
+  it('fuzzy-matches a subsequence spanning path segments under additionalDirs', async () => {
+    const extraDir = createExtraDir();
+    mkdirSync(join(extraDir, 'aa', 'bb'), { recursive: true });
+    writeFileSync(join(extraDir, 'aa', 'bb', 'cc.go'), 'package main');
+    const provider = new FileMentionProvider([], workDir, NO_FD, [extraDir]);
+
+    const result = await provider.getSuggestions(['@aabc'], 0, 5, { signal: ctrl() });
+
+    expect(result).not.toBeNull();
+    expect(result!.items.map((item) => item.value)).toContain(
+      `@${join(extraDir, 'aa', 'bb', 'cc.go').replaceAll('\\', '/')}`,
+    );
+  });
+
+  it('fuzzy-matches a query whose digits and letters are swapped in the path', async () => {
+    mkdirSync(join(workDir, '2'), { recursive: true });
+    writeFileSync(join(workDir, '2', 'foo.ts'), 'export {};');
+    const provider = new FileMentionProvider([], workDir, NO_FD);
+
+    const result = await provider.getSuggestions(['@foo2'], 0, 5, { signal: ctrl() });
+
+    expect(result).not.toBeNull();
+    expect(result!.items.map((item) => item.value)).toContain('@2/foo.ts');
+  });
+
+  it('does not match additionalDir entries on the machine path prefix', async () => {
+    const noiseRoot = mkdtempSync(join(tmpdir(), 'kimi-file-mention-noise-'));
+    extraDirs.push(noiseRoot);
+    const extraDir = join(noiseRoot, 'zeta-queue');
+    mkdirSync(extraDir, { recursive: true });
+    writeFileSync(join(extraDir, 'plain.txt'), 'x');
+    const provider = new FileMentionProvider([], workDir, NO_FD, [extraDir]);
+
+    const result = await provider.getSuggestions(['@z-q'], 0, 4, { signal: ctrl() });
+
+    expect(result?.items.map((item) => item.value) ?? []).not.toContain(
+      `@${join(extraDir, 'plain.txt').replaceAll('\\', '/')}`,
+    );
+  });
+
   it('uses the filesystem fallback for additionalDirs when fd is unavailable', async () => {
     const extraDir = createExtraDir();
     mkdirSync(join(extraDir, 'src'), { recursive: true });
@@ -314,9 +365,9 @@ describe('FileMentionProvider', () => {
     'uses fd for additionalDirs even when cwd is large enough to exhaust the fallback scanner',
     async () => {
       // Fill cwd with enough entries to push the filesystem fallback past its
-      // 2000-entry scan cap, so it would never reach the additional root. fd
+      // 5000-entry scan cap, so it would never reach the additional root. fd
       // searches each root independently and still finds the deep target.
-      for (let i = 0; i < 2000; i++) {
+      for (let i = 0; i < 5000; i++) {
         writeFileSync(join(workDir, `filler-${i}.ts`), 'export {};');
       }
       const extraDir = createExtraDir();
@@ -341,7 +392,7 @@ describe('FileMentionProvider', () => {
       // A bare "fd" (system PATH lookup) must not be mistaken for unavailable;
       // otherwise the large cwd would push the fallback scanner past its cap
       // and hide the deep target in the additional root.
-      for (let i = 0; i < 2000; i++) {
+      for (let i = 0; i < 5000; i++) {
         writeFileSync(join(workDir, `filler-${i}.ts`), 'export {};');
       }
       const extraDir = createExtraDir();
@@ -678,7 +729,7 @@ describe('FileMentionProvider', () => {
 
       expect(result).not.toBeNull();
       expect(result!.prefix).toBe('/');
-      expect(result!.items.map((item) => item.value).sort()).toEqual([
+      expect(result!.items.map((item) => item.value).toSorted()).toEqual([
         'skill:review',
         'skill:security',
       ]);
@@ -699,7 +750,7 @@ describe('FileMentionProvider', () => {
       const result = await provider.getSuggestions(['first line', '/'], 1, 1, { signal: ctrl() });
 
       expect(result).not.toBeNull();
-      expect(result!.items.map((item) => item.value).sort()).toEqual([
+      expect(result!.items.map((item) => item.value).toSorted()).toEqual([
         'skill:review',
         'skill:security',
       ]);

@@ -1,10 +1,15 @@
 import { spawn } from "child_process";
-import { readdirSync, statSync } from "fs";
+import { readdirSync, realpathSync, statSync } from "fs";
 import { homedir } from "os";
 import { basename, dirname, join } from "path";
-import { fuzzyFilter } from "./fuzzy.ts";
+import { fuzzyFilter, fuzzyMatch, fuzzyQueryVariants } from "./fuzzy.ts";
 
 const PATH_DELIMITERS = new Set([" ", "\t", '"', "'", "="]);
+const SEPARATOR_PATTERN = "[\\\\/]";
+const ROOT_SEPARATOR_PATTERN = `${SEPARATOR_PATTERN}+`;
+const FUZZY_MIN_QUERY_LENGTH = 2;
+const FUZZY_TOP_K = 20;
+const FD_MAX_RESULTS = 5000;
 
 function toDisplayPath(value: string): string {
 	return value.replace(/\\/g, "/");
@@ -26,7 +31,6 @@ function buildFdPathQuery(query: string): string {
 		return normalized;
 	}
 
-	const separatorPattern = "[\\\\/]";
 	const segments = trimmed
 		.split("/")
 		.filter(Boolean)
@@ -35,11 +39,79 @@ function buildFdPathQuery(query: string): string {
 		return normalized;
 	}
 
-	let pattern = segments.join(separatorPattern);
+	let pattern = segments.join(SEPARATOR_PATTERN);
 	if (hasTrailingSeparator) {
-		pattern += separatorPattern;
+		pattern += SEPARATOR_PATTERN;
 	}
 	return pattern;
+}
+
+// How fd should be invoked for one search. Separating the spec from the spawn
+// lets the caller run a precise and a fuzzy pass against the same base dir.
+type FdSearchSpec = {
+	pattern: string | null;
+	fullPath: boolean;
+	ignoreCase: boolean;
+};
+
+function buildFdPreciseSearch(query: string): FdSearchSpec {
+	return {
+		pattern: query ? buildFdPathQuery(query) : null,
+		fullPath: toDisplayPath(query).includes("/"),
+		ignoreCase: false,
+	};
+}
+
+// A slash-free query can still name a path through its segments ("aabc" ->
+// "aa/bb/cc.go"), which the basename-only precise pass never sees. Leading dots
+// and tildes are left to the precise pass so path-scoped input keeps its
+// existing meaning.
+function shouldSearchPathFuzzy(query: string): boolean {
+	const normalized = toDisplayPath(query);
+	return (
+		normalized.length >= FUZZY_MIN_QUERY_LENGTH &&
+		!normalized.includes("/") &&
+		!normalized.startsWith(".") &&
+		!normalized.startsWith("~")
+	);
+}
+
+// fd matches --full-path patterns against the canonical absolute path, so the
+// pattern is anchored to the canonical base dir: an unanchored subsequence would
+// match the machine path prefix and exhaust --max-results before fd reaches real
+// matches. The ".*" after the anchor keeps the subsequence free to start at any
+// depth below the base, and -i is required because the anchor carries the
+// machine's casing (e.g. /Users), which flips fd's smart-case to case-sensitive.
+// The leading separator is a run so UNC roots (//server/share/...) anchor too,
+// and the alternatives mirror fuzzyQueryVariants so fd admits every spelling the
+// scorer accepts.
+function buildFdFuzzySearch(query: string, baseDir: string): FdSearchSpec | null {
+	let canonicalBase: string;
+	try {
+		canonicalBase = toDisplayPath(realpathSync(baseDir));
+	} catch {
+		return null;
+	}
+
+	const drivePrefix = /^([A-Za-z]:)/.exec(canonicalBase)?.[1];
+	const pathPart = drivePrefix ? canonicalBase.slice(drivePrefix.length) : canonicalBase;
+	const anchorSegments = pathPart
+		.split("/")
+		.filter(Boolean)
+		.map((segment) => escapeRegex(segment));
+	const anchor = `^(?:[A-Za-z]:)?${ROOT_SEPARATOR_PATTERN}${anchorSegments.join(SEPARATOR_PATTERN)}`;
+	const buildSubsequence = (variant: string): string =>
+		[...variant].map((char) => escapeRegex(char)).join(".*");
+	const [primaryVariant, swappedVariant] = fuzzyQueryVariants(toDisplayPath(query));
+	const subsequence = swappedVariant
+		? `(?:${buildSubsequence(primaryVariant)}|${buildSubsequence(swappedVariant)})`
+		: buildSubsequence(primaryVariant);
+
+	return {
+		pattern: `${anchor}.*${subsequence}`,
+		fullPath: true,
+		ignoreCase: true,
+	};
 }
 
 function findLastDelimiter(text: string): number {
@@ -124,15 +196,14 @@ function buildCompletionValue(
 async function walkDirectoryWithFd(
 	baseDir: string,
 	fdPath: string,
-	query: string,
-	maxResults: number,
+	search: FdSearchSpec,
+	maxResults: number | undefined,
 	signal: AbortSignal,
+	onEntry?: (entry: { path: string; isDirectory: boolean }) => void,
 ): Promise<Array<{ path: string; isDirectory: boolean }>> {
 	const args = [
 		"--base-directory",
 		baseDir,
-		"--max-results",
-		String(maxResults),
 		"--type",
 		"f",
 		"--type",
@@ -146,13 +217,20 @@ async function walkDirectoryWithFd(
 		"--exclude",
 		".git/**",
 	];
+	if (maxResults !== undefined) {
+		args.splice(2, 0, "--max-results", String(maxResults));
+	}
 
-	if (toDisplayPath(query).includes("/")) {
+	if (search.fullPath) {
 		args.push("--full-path");
 	}
 
-	if (query) {
-		args.push(buildFdPathQuery(query));
+	if (search.ignoreCase) {
+		args.push("--ignore-case");
+	}
+
+	if (search.pattern) {
+		args.push(search.pattern);
 	}
 
 	return await new Promise((resolve) => {
@@ -165,6 +243,7 @@ async function walkDirectoryWithFd(
 			stdio: ["ignore", "pipe", "pipe"],
 		});
 		let stdout = "";
+		let pendingLine = "";
 		let resolved = false;
 
 		const finish = (results: Array<{ path: string; isDirectory: boolean }>) => {
@@ -182,14 +261,37 @@ async function walkDirectoryWithFd(
 
 		signal.addEventListener("abort", onAbort, { once: true });
 		child.stdout.setEncoding("utf-8");
+		const consumeLine = (line: string) => {
+			const displayLine = toDisplayPath(line);
+			const hasTrailingSeparator = displayLine.endsWith("/");
+			const normalizedPath = hasTrailingSeparator ? displayLine.slice(0, -1) : displayLine;
+			if (!normalizedPath || normalizedPath === ".git" || normalizedPath.startsWith(".git/") || normalizedPath.includes("/.git/")) {
+				return;
+			}
+			onEntry?.({ path: displayLine, isDirectory: hasTrailingSeparator });
+		};
 		child.stdout.on("data", (chunk: string) => {
-			stdout += chunk;
+			if (onEntry) {
+				pendingLine += chunk;
+				const lines = pendingLine.split("\n");
+				pendingLine = lines.pop() ?? "";
+				for (const line of lines) {
+					if (line) consumeLine(line);
+				}
+			} else {
+				stdout += chunk;
+			}
 		});
 		child.on("error", () => {
 			finish([]);
 		});
 		child.on("close", (code) => {
-			if (signal.aborted || code !== 0 || !stdout) {
+			if (onEntry && pendingLine) consumeLine(pendingLine);
+			if (signal.aborted || code !== 0 || (!onEntry && !stdout)) {
+				finish([]);
+				return;
+			}
+			if (onEntry) {
 				finish([]);
 				return;
 			}
@@ -201,14 +303,9 @@ async function walkDirectoryWithFd(
 				const displayLine = toDisplayPath(line);
 				const hasTrailingSeparator = displayLine.endsWith("/");
 				const normalizedPath = hasTrailingSeparator ? displayLine.slice(0, -1) : displayLine;
-				if (normalizedPath === ".git" || normalizedPath.startsWith(".git/") || normalizedPath.includes("/.git/")) {
-					continue;
+				if (normalizedPath && normalizedPath !== ".git" && !normalizedPath.startsWith(".git/") && !normalizedPath.includes("/.git/")) {
+					results.push({ path: displayLine, isDirectory: hasTrailingSeparator });
 				}
-
-				results.push({
-					path: displayLine,
-					isDirectory: hasTrailingSeparator,
-				});
 			}
 
 			finish(results);
@@ -733,6 +830,10 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 		else if (lowerFileName.includes(lowerQuery)) score = 50;
 		// Substring match in full path
 		else if (filePath.toLowerCase().includes(lowerQuery)) score = 30;
+		// Subsequence match across the relative path. Kept below the substring
+		// tiers: 10 plus the directory bonus stays under the 30 tier, so a fuzzy
+		// hit never outranks a real substring hit.
+		else if (fuzzyMatch(query, filePath).matches) score = 10;
 
 		// Directories get a bonus to appear first
 		if (isDirectory && score > 0) score += 10;
@@ -822,10 +923,41 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 				return [];
 			}
 
+			const allowFuzzy = shouldSearchPathFuzzy(query);
+
 			const perRoot = await Promise.all(
 				targets.map(async (target) => {
-					const entries = await walkDirectoryWithFd(target.baseDir, fdPath, target.fdQuery, 100, options.signal);
-					return entries.map((entry) => ({ entry, target }));
+					const fuzzySearch = allowFuzzy ? buildFdFuzzySearch(target.fdQuery, target.baseDir) : null;
+					const fuzzyEntries: Array<{ path: string; isDirectory: boolean }> = [];
+					const onFuzzyEntry = fuzzySearch
+						? (entry: { path: string; isDirectory: boolean }) => {
+							const score = this.scoreEntry(entry.path, target.fdQuery, entry.isDirectory);
+							if (score <= 0) return;
+							const fuzzyScore = fuzzyMatch(target.fdQuery, entry.path).score;
+							fuzzyEntries.push(entry);
+							fuzzyEntries.sort(
+								(a, b) =>
+									this.scoreEntry(b.path, target.fdQuery, b.isDirectory) -
+										this.scoreEntry(a.path, target.fdQuery, a.isDirectory) ||
+										fuzzyMatch(target.fdQuery, a.path).score - fuzzyMatch(target.fdQuery, b.path).score ||
+										a.path.localeCompare(b.path),
+							);
+							if (fuzzyEntries.length > FUZZY_TOP_K) fuzzyEntries.pop();
+						  }
+						: undefined;
+					const [precise, fuzzy] = await Promise.all([
+						walkDirectoryWithFd(
+							target.baseDir,
+							fdPath,
+							buildFdPreciseSearch(target.fdQuery),
+							FD_MAX_RESULTS,
+							options.signal,
+						),
+						fuzzySearch
+							? walkDirectoryWithFd(target.baseDir, fdPath, fuzzySearch, undefined, options.signal, onFuzzyEntry)
+							: Promise.resolve([]),
+					]);
+					return [...precise, ...fuzzyEntries, ...fuzzy].map((entry) => ({ entry, target }));
 				}),
 			);
 			if (options.signal.aborted) {
@@ -836,6 +968,7 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 				path: string;
 				isDirectory: boolean;
 				score: number;
+				fuzzyScore: number;
 				target: RootTarget;
 				absPath: string;
 			};
@@ -844,6 +977,7 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 				for (const { entry, target } of group) {
 					const score = target.fdQuery ? this.scoreEntry(entry.path, target.fdQuery, entry.isDirectory) : 1;
 					if (score <= 0) continue;
+					const fuzzyScore = target.fdQuery ? fuzzyMatch(target.fdQuery, entry.path).score : 0;
 					const pathWithoutSlash = entry.isDirectory ? entry.path.slice(0, -1) : entry.path;
 					const absPath = target.absolute
 						? toDisplayPath(join(target.displayBase, pathWithoutSlash))
@@ -854,6 +988,7 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 							path: entry.path,
 							isDirectory: entry.isDirectory,
 							score,
+							fuzzyScore,
 							target,
 							absPath,
 						});
@@ -862,7 +997,8 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 			}
 
 			const scored = [...bestByAbs.values()];
-			scored.sort((a, b) => b.score - a.score);
+			// fd 输出顺序不保证质量，统一在本地按匹配分数和路径排序后截取结果。
+			scored.sort((a, b) => b.score - a.score || a.fuzzyScore - b.fuzzyScore || a.absPath.localeCompare(b.absPath));
 			const topEntries = scored.slice(0, 20);
 
 			const suggestions: AutocompleteItem[] = [];
