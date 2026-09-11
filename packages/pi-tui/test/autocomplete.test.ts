@@ -228,6 +228,150 @@ describe("CombinedAutocompleteProvider", () => {
 			assert.ok(!values?.includes("@packages/ai/src/autocomplete.ts"));
 		});
 
+		test("matches a subsequence spanning path segments", async () => {
+			setupFolder(baseDir, {
+				files: {
+					"aa/bb/cc.go": "package main",
+				},
+			});
+
+			const provider = new CombinedAutocompleteProvider([], baseDir, requireFdPath());
+			const line = "@aabc";
+			const result = await getSuggestions(provider, [line], 0, line.length);
+
+			const values = result?.items.map((item) => item.value) ?? [];
+			assert.ok(values.includes("@aa/bb/cc.go"), `expected @aa/bb/cc.go, got ${JSON.stringify(values)}`);
+		});
+
+		test("matches a subsequence that starts inside the relative path", async () => {
+			setupFolder(baseDir, {
+				files: {
+					"aa/bb/cc.go": "package main",
+				},
+			});
+
+			const provider = new CombinedAutocompleteProvider([], baseDir, requireFdPath());
+			const line = "@bcc";
+			const result = await getSuggestions(provider, [line], 0, line.length);
+
+			const values = result?.items.map((item) => item.value) ?? [];
+			assert.ok(values.includes("@aa/bb/cc.go"), `expected @aa/bb/cc.go, got ${JSON.stringify(values)}`);
+		});
+
+		test("matches a subsequence case insensitively", async () => {
+			setupFolder(baseDir, {
+				files: {
+					"aa/bb/cc.go": "package main",
+				},
+			});
+
+			const provider = new CombinedAutocompleteProvider([], baseDir, requireFdPath());
+			const line = "@AABC";
+			const result = await getSuggestions(provider, [line], 0, line.length);
+
+			const values = result?.items.map((item) => item.value) ?? [];
+			assert.ok(values.includes("@aa/bb/cc.go"), `expected @aa/bb/cc.go, got ${JSON.stringify(values)}`);
+		});
+
+		test("matches a query whose digits and letters are swapped in the path", async () => {
+			setupFolder(baseDir, {
+				files: {
+					"2/foo.ts": "export {};",
+				},
+			});
+
+			const provider = new CombinedAutocompleteProvider([], baseDir, requireFdPath());
+			const line = "@foo2";
+			const result = await getSuggestions(provider, [line], 0, line.length);
+
+			const values = result?.items.map((item) => item.value) ?? [];
+			assert.ok(values.includes("@2/foo.ts"), `expected @2/foo.ts, got ${JSON.stringify(values)}`);
+		});
+
+		test("ranks a filename match above a fuzzy path match", async () => {
+			setupFolder(baseDir, {
+				files: {
+					"aabc.ts": "export {};",
+					"aa/bb/cc.go": "package main",
+				},
+			});
+
+			const provider = new CombinedAutocompleteProvider([], baseDir, requireFdPath());
+			const line = "@aabc";
+			const result = await getSuggestions(provider, [line], 0, line.length);
+
+			const values = result?.items.map((item) => item.value) ?? [];
+			assert.strictEqual(values[0], "@aabc.ts");
+			assert.ok(values.includes("@aa/bb/cc.go"), `expected @aa/bb/cc.go, got ${JSON.stringify(values)}`);
+		});
+
+		test("does not fuzzy-match files outside the search roots", async () => {
+			setupFolder(outsideDir, {
+				files: {
+					"aa/bb/cc.go": "package main",
+				},
+			});
+
+			const provider = new CombinedAutocompleteProvider([], baseDir, requireFdPath());
+			const line = "@aabc";
+			const result = await getSuggestions(provider, [line], 0, line.length);
+
+			const values = result?.items.map((item) => item.value) ?? [];
+			assert.deepStrictEqual(values, []);
+		});
+
+		test("fuzzy-matches deep files under additional roots", async () => {
+			setupFolder(outsideDir, {
+				files: {
+					"aa/bb/cc.go": "package main",
+				},
+			});
+
+			const provider = new CombinedAutocompleteProvider([], baseDir, requireFdPath(), [outsideDir]);
+			const line = "@aabc";
+			const result = await getSuggestions(provider, [line], 0, line.length);
+
+			const values = result?.items.map((item) => item.value) ?? [];
+			assert.ok(values.includes(`@${join(outsideDir, "aa/bb/cc.go").replace(/\\/g, "/")}`));
+		});
+
+		test("matches a partial path from the issue example", async () => {
+			setupFolder(baseDir, {
+				files: {
+					"aa/bb/cc.go": "package main",
+				},
+			});
+
+			const provider = new CombinedAutocompleteProvider([], baseDir, requireFdPath());
+			const line = "@bb/cc";
+			const result = await getSuggestions(provider, [line], 0, line.length);
+
+			const values = result?.items.map((item) => item.value) ?? [];
+			assert.ok(values.includes("@aa/bb/cc.go"), `expected @aa/bb/cc.go, got ${JSON.stringify(values)}`);
+		});
+
+		test("fuzzy-matches when the base dir contains regex metacharacters", async () => {
+			const weirdRoot = mkdtempSync(join(tmpdir(), "pi+auto(complete)[root]-"));
+			const weirdBase = join(weirdRoot, "cwd");
+			mkdirSync(weirdBase, { recursive: true });
+			try {
+				setupFolder(weirdBase, {
+					files: {
+						"aa/bb/cc.go": "package main",
+					},
+				});
+
+				const provider = new CombinedAutocompleteProvider([], weirdBase, requireFdPath());
+				const line = "@aabc";
+				const result = await getSuggestions(provider, [line], 0, line.length);
+
+				const values = result?.items.map((item) => item.value) ?? [];
+				assert.ok(values.includes("@aa/bb/cc.go"), `expected @aa/bb/cc.go, got ${JSON.stringify(values)}`);
+			} finally {
+				rmSync(weirdRoot, { recursive: true, force: true });
+			}
+		});
+
 		test("searches additional base paths with fd for @ mentions", async () => {
 			setupFolder(baseDir, {
 				files: { "shared-cwd.ts": "export {};" },

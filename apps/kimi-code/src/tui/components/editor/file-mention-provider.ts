@@ -13,7 +13,10 @@ import {
 import { findInlineSkillTokens } from '../../utils/inline-skill-tokens';
 
 const PATH_DELIMITERS = new Set([' ', '\t', '"', "'", '=']);
-const MAX_FALLBACK_SCAN = 2000;
+// The scan is a full directory walk regardless, so the cap only bounds how much
+// of a large tree reaches the ranking — it is not a target. Matched to the fd
+// pass cap in pi-tui so a repo that overflows one path overflows both.
+const MAX_FALLBACK_SCAN = 5000;
 const MAX_FALLBACK_SUGGESTIONS = 50;
 
 export interface SlashAutocompleteCommand extends SlashCommand {
@@ -22,6 +25,7 @@ export interface SlashAutocompleteCommand extends SlashCommand {
 
 interface FsMentionCandidate {
   readonly path: string;
+  readonly matchPath: string;
   readonly absolutePath: string;
   readonly isDirectory: boolean;
 }
@@ -482,6 +486,7 @@ function collectFsMentionCandidates(
         if (!candidatesByAbsolutePath.has(absolutePath)) {
           candidatesByAbsolutePath.set(absolutePath, {
             path: isAdditionalDir ? absolutePath : relativePath,
+            matchPath: relativePath,
             absolutePath,
             isDirectory,
           });
@@ -501,11 +506,17 @@ function rankFsMentionCandidates(
   query: string,
 ): FsMentionCandidate[] {
   const lowerQuery = query.toLowerCase();
-  const scored: Array<{ candidate: FsMentionCandidate; score: number }> = [];
+  const scored: Array<{ candidate: FsMentionCandidate; score: number; fuzzyScore: number }> = [];
 
   for (const candidate of candidates) {
     const score = scoreCandidate(candidate, lowerQuery);
-    if (score > 0) scored.push({ candidate, score });
+    if (score > 0) {
+      scored.push({
+        candidate,
+        score,
+        fuzzyScore: lowerQuery.length > 0 ? fuzzyMatch(lowerQuery, candidate.matchPath).score : 0,
+      });
+    }
   }
 
   scored.sort((a, b) => {
@@ -513,6 +524,7 @@ function rankFsMentionCandidates(
     if (a.candidate.isDirectory !== b.candidate.isDirectory) {
       return a.candidate.isDirectory ? -1 : 1;
     }
+    if (a.fuzzyScore !== b.fuzzyScore) return a.fuzzyScore - b.fuzzyScore;
     return a.candidate.path.localeCompare(b.candidate.path);
   });
 
@@ -532,6 +544,11 @@ function scoreCandidate(candidate: FsMentionCandidate, lowerQuery: string): numb
   else if (lowerBase.startsWith(lowerQuery)) score = 80;
   else if (lowerBase.includes(lowerQuery)) score = 50;
   else if (lowerPath.includes(lowerQuery)) score = 30;
+  // Subsequence match across the root-relative path — "aabc" reaches
+  // "aa/bb/cc.go". Matched against matchPath rather than path so a machine
+  // directory prefix cannot produce a hit. Kept below the substring tiers: 10
+  // plus the directory bonus stays under the 30 tier.
+  else if (fuzzyMatch(lowerQuery, candidate.matchPath).matches) score = 10;
   if (candidate.isDirectory && score > 0) score += 10;
   return score;
 }

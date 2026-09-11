@@ -1,6 +1,26 @@
 import assert from "node:assert";
 import { describe, it } from "node:test";
-import { fuzzyFilter, fuzzyMatch } from "../src/fuzzy.ts";
+import { fuzzyFilter, fuzzyMatch, fuzzyQueryVariants } from "../src/fuzzy.ts";
+
+describe("fuzzyQueryVariants", () => {
+	it("offers only the query itself when neither run can be swapped", () => {
+		assert.deepStrictEqual(fuzzyQueryVariants("autocomplete"), ["autocomplete"]);
+		assert.deepStrictEqual(fuzzyQueryVariants("f2o"), ["f2o"]);
+	});
+
+	it("offers the digits-first spelling for a letters-then-digits query", () => {
+		assert.deepStrictEqual(fuzzyQueryVariants("foo2"), ["foo2", "2foo"]);
+	});
+
+	it("offers the letters-first spelling for a digits-then-letters query", () => {
+		assert.deepStrictEqual(fuzzyQueryVariants("2bar"), ["2bar", "bar2"]);
+	});
+
+	it("lower-cases every spelling", () => {
+		assert.deepStrictEqual(fuzzyQueryVariants("FOO2"), ["foo2", "2foo"]);
+		assert.deepStrictEqual(fuzzyQueryVariants("2Bar"), ["2bar", "bar2"]);
+	});
+});
 
 describe("fuzzyMatch", () => {
 	it("empty query matches everything with score 0", () => {
